@@ -1,0 +1,133 @@
+#!/bin/bash
+# vim: set ts=4 sw=4 noet:
+
+# MIT License
+#
+# Copyright (c) 2018 Ahmed Bessifi
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+ETCD_SERVER_PORT="2379"
+ETCD_PEER_CERT="/etc/etcd/peer.crt"
+ETCD_PEER_KEY="/etc/etcd/peer.key"
+ETCD_PEER_CACERT="/etc/etcd/ca.crt"
+
+OUTPUT_MSG="UNKNOWN"
+EXIT_CODE=3
+
+usage(){
+
+    echo \
+"
+Usage: $0 [command] <hostname>
+
+Available Commands:
+    cluster-health      Get Etcd cluster health
+    alpr                Get Average Latency Per Request
+"
+    exit 3
+}
+
+
+setup(){
+  # Create a tmp file to save the `etcdctl` output there
+  TMP_FILE=$(mktemp /tmp/.check-etcd.XXXXXX)
+}
+
+teardown(){
+  # Remove tmp file before exit
+  rm -f $TMP_FILE
+}
+
+# Get Average Latency Per Request with linearized consistency.
+# Linearizable read requests go through a quorum of cluster members for consensus to fetch the most recent data.
+get-alpr(){
+
+  # The Average Latency Per Request threshold are as follow:
+  # OK: average_latency_per_request < 0.1s
+  # WARNING: 0.1s <= average_latency_per_request < 1s
+  # CRITICAL: average_latency_per_request >= 1s
+
+  average_latency_per_request=$(etcd-benchmark --cert ${ETCD_PEER_CERT} --key ${ETCD_PEER_KEY} --cacert ${ETCD_PEER_CACERT} --endpoints ${ETCD_SERVER_ADDR}:${ETCD_SERVER_PORT} --conns=1 --clients=1 range /dummy --consistency=l --total=1 | awk '/.*Average/  { print $2 }')
+
+  if [ $(echo "$average_latency_per_request < 0.1" | bc -l) -eq 1 ]; then
+    OUTPUT_MSG="OK - Average Latency Per Request: ${average_latency_per_request} secs"
+    EXIT_CODE=0
+  elif [ $(echo "($average_latency_per_request >= 0.1) && ($average_latency_per_request < 1)" | bc -l) -eq 1 ]; then
+    OUTPUT_MSG="WARNING - Average Latency Per Request: ${average_latency_per_request} secs"
+    EXIT_CODE=1
+  else
+    OUTPUT_MSG="CRITICAL - Average Latency Per Request: ${average_latency_per_request} secs"
+    EXIT_CODE=2
+  fi
+
+}
+
+# Check the cluster status.
+# We assume that the server is listening to the standard port 2379 and the TLS certs and key are named as follow.
+get-cluster-health(){
+
+  etcdctl --cert-file ${ETCD_PEER_CERT} \
+          --key-file ${ETCD_PEER_KEY} \
+          --ca-file ${ETCD_PEER_CACERT} \
+          --endpoints https://${ETCD_SERVER_ADDR}:${ETCD_SERVER_PORT} \
+          cluster-health > $TMP_FILE
+
+  # Get the check command return code
+  etcd_check_cluster_rc=$?
+
+  # Get cluster members if OK
+  if [ $etcd_check_cluster_rc -eq 0 ]; then
+    etcd_cluster_members=$(cat $TMP_FILE | awk '$1 ~ /^member/ { print $NF }' | sed -e :a -e '$!N; s/\n/,/; ta')
+  fi
+
+  # Prepare output message according to the cluster state
+  if [ $(grep -Fxc 'cluster is healthy' $TMP_FILE) -eq 1 ] && [ $etcd_check_cluster_rc -eq 0  ]; then
+    OUTPUT_MSG="OK - Cluster state: healthy | Members=${etcd_cluster_members}"
+    EXIT_CODE=0
+  else
+    OUTPUT_MSG="CRITICAL - Cluster state: unhealthy"
+    EXIT_CODE=2
+  fi
+}
+
+#
+# main()
+#
+# Exit with error if the etcd server name is not passed as argument to the script
+if [ $# -ne 2 ]; then
+  usage
+  exit 3
+fi
+
+COMMAND_NAME=$1
+ETCD_SERVER_ADDR=$2
+
+setup
+
+if [ $COMMAND_NAME == "cluster-health" ]; then
+  get-cluster-health
+elif [ $COMMAND_NAME == "alpr" ]; then
+  get-alpr
+fi
+
+teardown
+
+echo $OUTPUT_MSG
+exit $EXIT_CODE
